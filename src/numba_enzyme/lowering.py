@@ -74,7 +74,12 @@ _NRT_DTOR_DECLARE_RE = re.compile(
     r"^(declare\s+void\s+@NRT_MemInfo_call_dtor\([^)]*\))(.*)$", re.MULTILINE
 )
 
-llvm_binding.initialize()
+try:
+    llvm_binding.initialize()
+except RuntimeError:
+    # llvmlite >= 0.45 initialises LLVM on import and raises on an explicit
+    # call, so tolerate its absence rather than pinning the older llvmlite.
+    pass
 
 
 class LoweringError(RuntimeError):
