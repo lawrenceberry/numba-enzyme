@@ -145,11 +145,18 @@ def test_tuple_output_forward_derivatives():
     assert diff.jacfwd_column(x, y, 1) == pytest.approx((x, 1.0), abs=1e-9)
 
 
-def test_tuple_output_rejects_grad():
+def test_tuple_output_reverse_derivatives():
     diff = load(build(f_tuple))
+    x, y = 1.3, 0.7
 
-    with pytest.raises(TypeError, match="scalar-output"):
-        diff.grad(1.3, 0.7)
+    assert diff.vjp((x, y), (0.25, -0.5)) == pytest.approx(
+        (y * 0.25 - x, x * 0.25 - 0.5), abs=1e-9
+    )
+    jacobian = diff.jacrev(x, y)
+    assert jacobian[0] == pytest.approx((y, x), abs=1e-9)
+    assert jacobian[1] == pytest.approx((2 * x, 1.0), abs=1e-9)
+    assert diff.jacrev_row(x, y, 0) == pytest.approx((y, x), abs=1e-9)
+    assert diff.jacrev_row(x, y, 1) == pytest.approx((2 * x, 1.0), abs=1e-9)
 
 
 def test_float32_tuple_output_uses_float32_runtime_abi():
@@ -157,6 +164,9 @@ def test_float32_tuple_output_uses_float32_runtime_abi():
     jacobian = diff.jacfwd(1.25, 0.75)
     assert jacobian[0] == pytest.approx((0.75, 1.25), abs=1e-6)
     assert jacobian[1] == pytest.approx((1.0, 1.0), abs=1e-6)
+    reverse = diff.jacrev(1.25, 0.75)
+    assert reverse[0] == pytest.approx((0.75, 1.25), abs=1e-6)
+    assert reverse[1] == pytest.approx((1.0, 1.0), abs=1e-6)
 
 
 def farr_tuple(x: Array1D(Float64)) -> tuple[Float64, Float64]:
@@ -179,9 +189,21 @@ def test_tuple_output_jvp_for_array_argument():
         assert got == pytest.approx((1.0, np.prod(x) / x[i]), abs=1e-9)
 
 
-def test_jacfwd_rejects_array_argument():
+def test_tuple_output_vjp_for_array_argument():
+    diff = load(build(farr_tuple))
+    x = np.array([1.0, 2.0, 3.0])
+
+    (by_sum,) = diff.vjp((x,), (1.0, 0.0))
+    assert by_sum == pytest.approx(np.ones_like(x), abs=1e-9)
+    (by_product,) = diff.vjp((x,), (0.0, 1.0))
+    assert by_product == pytest.approx(np.prod(x) / x, abs=1e-9)
+
+
+def test_jacobians_reject_array_arguments():
     diff = load(build(farr))
     x = np.array([1.0, 2.0, 3.0])
 
     with pytest.raises(TypeError, match="does not support array arguments"):
         diff.jacfwd(x)
+    with pytest.raises(TypeError, match="does not support array arguments"):
+        diff.jacrev(x)
