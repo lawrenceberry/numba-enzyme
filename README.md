@@ -34,6 +34,12 @@ def f(x: Float64, y: Float64) -> Float64:
 grad(f)(1.0, 2.0)               # -> (df/dx, df/dy)
 jvp(f)((1.0, 2.0), (1.0, 0.0))  # -> directional derivative along (1.0, 0.0)
 
+def f_vec(x: Float64, y: Float64) -> tuple[Float64, Float64]:
+    return x * y, x * x + y
+
+jvp(f_vec)((1.0, 2.0), (1.0, 0.0))  # -> (2.0, 2.0), one tangent per output
+
+
 @differentiable
 def g(x: Float64, y: Float64) -> Float64:
     return x * y + math.cos(x * y)
@@ -44,16 +50,21 @@ g.grad(1.0, 2.0)      # reverse-mode gradient, built lazily on first access
 g.jvp((1.0, 2.0), (1.0, 0.0))  # forward-mode JVP
 ```
 
+`grad` requires its target function to return exactly one scalar. It does not
+accept tuple-valued targets. `jvp` handles both scalar and tuple outputs.
+Tuple outputs must be fixed-size and homogeneous.
+
 ### Choosing a differentiation operation
 
 | API | Mode | Result and typical use |
 |---|---|---|
-| `grad` | Reverse | Gradient in one reverse sweep. Prefer this for scalar losses, particularly with many inputs. |
+| `grad` | Reverse | Gradient of a **single scalar output** in one reverse sweep. Prefer this for scalar losses, particularly with many inputs. |
 | `jvp` | Forward | Jacobian-vector product `J @ tangent` without constructing the Jacobian. Use it for a known input direction. |
 
 ### Scope
 * It is still not possible to mark the arguments as active or constant.
-* The arguments and the return value can be of scalar type only at the moment.
+* Arguments may be scalars or arrays; results may be scalar or fixed-size
+  homogeneous tuples of scalars. Array outputs are not yet supported.
 * Linear algebra e.g. `np.dot`, `np.linalg.norm` etc are not supported.
 
 ## License
