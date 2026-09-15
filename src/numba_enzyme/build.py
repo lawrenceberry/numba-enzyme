@@ -41,20 +41,23 @@ _DEFAULT_CACHE_DIR = Path.home() / ".cache" / "numba_enzyme"
 @dataclass(frozen=True)
 class BuiltKernel:
     """
-    A compiled, cacheable shared object exposing grad/JVP entry points.
+    A compiled, cacheable shared object exposing derivative entry points.
 
     Attributes
     ----------
     path : pathlib.Path
         Path to the built `.so` file.
-    grad_symbol : str
-        Name of the reverse-mode entry point exported by `path`.
     jvp_symbol : str
         Name of the forward-mode entry point exported by `path`.
+    vjp_symbol : str
+        Name of the reverse-mode vector-Jacobian product entry point exported
+        by `path`.
     n_args : int
         Number of scalar arguments the original function takes.
     n_outputs : int
         Number of scalar output components.
+    return_type : str
+        LLVM textual type of each output component.
     from_cache : bool
         Whether the shared object was loaded from the disk.
 
@@ -73,10 +76,11 @@ class BuiltKernel:
     """
 
     path: Path
-    grad_symbol: str
     jvp_symbol: str
+    vjp_symbol: str
     n_args: int
     n_outputs: int
+    return_type: str
     arg_specs: tuple[ArgSpec, ...]
     from_cache: bool
 
@@ -260,10 +264,11 @@ def build(func: Callable) -> BuiltKernel:
         raw_meta = json.loads(meta_path.read_text())
         try:
             meta = {
-                "grad_symbol": raw_meta["grad_symbol"],
                 "jvp_symbol": raw_meta["jvp_symbol"],
+                "vjp_symbol": raw_meta["vjp_symbol"],
                 "n_args": raw_meta["n_args"],
                 "n_outputs": raw_meta["n_outputs"],
+                "return_type": raw_meta["return_type"],
                 "arg_specs": tuple(ArgSpec(**spec) for spec in raw_meta["arg_specs"]),
             }
         except (KeyError, TypeError):
@@ -381,10 +386,11 @@ def build(func: Callable) -> BuiltKernel:
     )
 
     meta = {
-        "grad_symbol": drv.grad_symbol,
         "jvp_symbol": drv.jvp_symbol,
+        "vjp_symbol": drv.vjp_symbol,
         "n_args": kernel.n_args,
         "n_outputs": kernel.n_outputs,
+        "return_type": kernel.return_type,
         "arg_specs": kernel.arg_specs,
     }
     meta_path.write_text(json.dumps(meta, default=vars))

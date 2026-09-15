@@ -1,12 +1,15 @@
 """
 Load a built shared object and expose it as plain Python callables.
 
-Wraps a `numba_enzyme.build.BuiltKernel`'s `grad_<entry>``/
-`jvp_<entry>` symbols with :mod:`ctypes`.
-`grad_<entry>` is void and writes through an explicit output pointer
-uniformly for every arity. `jvp_<entry>` returns a bare `float` for a
-scalar result, regardless of arity, and writes through a trailing output
-pointer for a tuple result.
+Wraps a `numba_enzyme.build.BuiltKernel`'s ``jvp_<entry>``/``vjp_<entry>``
+symbols with :mod:`ctypes` and derives every other mode from them: the
+gradient and the reverse-mode Jacobians are vector-Jacobian products under
+unit cotangents, and the forward-mode Jacobians are JVPs under unit tangents.
+``vjp_<entry>`` is void and writes through one explicit output pointer per
+scalar argument, uniformly for every arity, and accumulates an array argument's
+gradient into a caller-owned shadow buffer (see `numba_enzyme.driver`).
+For a scalar result, ``jvp_<entry>`` returns a bare scalar. For a tuple result,
+it writes the output tangent through a trailing pointer.
 
 See Also
 --------
@@ -25,6 +28,7 @@ Examples
 """
 
 import ctypes
+import operator
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -33,10 +37,7 @@ import numpy as np
 from numba_enzyme.build import BuiltKernel
 from numba_enzyme.lowering import ArgSpec
 
-# Maps an ArgSpec.elem_llvm_type string to its ctypes equivalent, for
-# converting an array argument's data/shadow pointers.
-# TODO: expand alongside numba_enzyme.lowering._LLVM_SCALAR_TYPE
-_ELEM_CTYPE = {
+_CTYPES_SCALAR_TYPE = {
     "double": ctypes.c_double,
     "float": ctypes.c_float,
     "i32": ctypes.c_int32,
@@ -62,12 +63,39 @@ def _array_ctypes_argtypes(spec: ArgSpec) -> list:
     list
         The ctypes types for this argument's flattened parameter group.
     """
-    elem_ptr = ctypes.POINTER(_ELEM_CTYPE[spec.elem_llvm_type])
+    elem_ptr = ctypes.POINTER(_CTYPES_SCALAR_TYPE[spec.elem_llvm_type])
     return (
         [elem_ptr, elem_ptr, ctypes.c_int64, ctypes.c_int64]
         + [ctypes.c_int64] * spec.ndim
         + [ctypes.c_int64] * spec.ndim
     )
+
+
+def _argument_ctypes(arg_specs, forward: bool) -> list:
+    """
+    Provide ctypes argtypes for the primal arguments of an entry point.
+
+    Parameters
+    ----------
+    arg_specs : tuple of numba_enzyme.lowering.ArgSpec
+        One specification per logical argument.
+    forward : bool
+        Whether the entry point is forward mode, which pairs every scalar
+        argument with its tangent.
+
+    Returns
+    -------
+    list
+        The ctypes types for the primal arguments, in order.
+    """
+    argtypes = []
+    for spec in arg_specs:
+        if spec.kind == "scalar":
+            ctype = _CTYPES_SCALAR_TYPE[spec.llvm_type]
+            argtypes += [ctype, ctype] if forward else [ctype]
+        else:
+            argtypes += _array_ctypes_argtypes(spec)
+    return argtypes
 
 
 def _as_array_args(arr: np.ndarray, spec: ArgSpec):
@@ -101,7 +129,7 @@ def _as_array_args(arr: np.ndarray, spec: ArgSpec):
         raise ValueError(f"expected an ndim={spec.ndim} array, got ndim={arr.ndim}")
     if not arr.flags["C_CONTIGUOUS"]:
         raise ValueError("array arguments must be C-contiguous")
-    elem_ctype = _ELEM_CTYPE[spec.elem_llvm_type]
+    elem_ctype = _CTYPES_SCALAR_TYPE[spec.elem_llvm_type]
     data_ptr = arr.ctypes.data_as(ctypes.POINTER(elem_ctype))
     return (
         data_ptr,
@@ -112,23 +140,83 @@ def _as_array_args(arr: np.ndarray, spec: ArgSpec):
     )
 
 
+def _primal_args(arg_specs, xs, shadows) -> list:
+    """
+    Flatten primal values and their shadows into entry-point arguments.
+
+    Parameters
+    ----------
+    arg_specs : tuple of numba_enzyme.lowering.ArgSpec
+        One specification per logical argument.
+    xs : tuple
+        The primal values, a `float` per scalar argument and a
+        `numpy.ndarray` per array argument.
+    shadows : tuple
+        One shadow per argument: in forward mode its tangent, in reverse mode
+        `None` for a scalar and the zeroed gradient buffer for an array.
+
+    Returns
+    -------
+    list
+        The arguments to pass after any leading output pointers.
+
+    Raises
+    ------
+    TypeError
+        If a value's Python type doesn't match its declared scalar/array kind.
+    ValueError
+        If an array's shadow doesn't match its shape.
+    """
+    call_args = []
+    for position, (spec, x, shadow) in enumerate(zip(arg_specs, xs, shadows)):
+        if spec.kind == "scalar":
+            if isinstance(x, np.ndarray):
+                raise TypeError(
+                    f"argument {position} expected a scalar, got an ndarray"
+                )
+            call_args.append(x)
+            if shadow is not None:
+                call_args.append(shadow)
+            continue
+        if not isinstance(x, np.ndarray) or not isinstance(shadow, np.ndarray):
+            raise TypeError(
+                f"argument {position} expected numpy.ndarray primal and tangent"
+            )
+        if shadow.shape != x.shape:
+            raise ValueError(
+                f"argument {position}'s tangent shape {shadow.shape} doesn't "
+                f"match its primal shape {x.shape}"
+            )
+        data_ptr, nitems, itemsize, shape, strides = _as_array_args(x, spec)
+        elem_ctype = _CTYPES_SCALAR_TYPE[spec.elem_llvm_type]
+        d_data_ptr = shadow.ctypes.data_as(ctypes.POINTER(elem_ctype))
+        call_args += [data_ptr, d_data_ptr, nitems, itemsize, *shape, *strides]
+    return call_args
+
+
 @dataclass(frozen=True)
 class Differentiable:
     """
-    Plain Python callables wrapping a built kernel's grad/JVP symbols.
+    Plain Python callables wrapping a built kernel's derivative symbols.
 
     Attributes
     ----------
     grad : callable
         Computes the reverse-mode gradient. Takes `n_args` positional
         arguments and returns a `tuple` of `n_args`; raises `TypeError`
-        if called with the wrong number of arguments or on a tuple result.
+        if called with the wrong number of arguments or on a vector result.
     jvp : callable
         Computes the forward-mode Jacobian-vector product. Takes a
         `tuple` of `n_args` primal values and a `tuple` of `n_args`
-        tangent values, and returns a single `float`, or a `tuple` of
-        `n_outputs` for a tuple result; raises `TypeError` if either
-        tuple has the wrong length.
+        tangent values, and returns a single `float`; raises
+        `TypeError` if either tuple has the wrong length.
+    jacfwd : callable
+        Computes the full forward-mode Jacobian. Takes `n_args` positional
+        arguments and returns a derivative tuple for a scalar result or an
+        output-by-input tuple matrix for a vector result.
+    jacfwd_column : callable
+        Computes one forward-mode Jacobian column. Takes `n_args` primal values
+        followed by a column index and returns a scalar or output tuple.
     n_args : int
         Number of scalar arguments the underlying function takes.
     n_outputs : int
@@ -151,8 +239,94 @@ class Differentiable:
 
     grad: Callable[..., tuple[float, ...]]
     jvp: Callable[[tuple[float, ...], tuple[float, ...]], float | tuple[float, ...]]
+    jacfwd: Callable[..., tuple]
+    jacfwd_column: Callable[..., float | tuple[float, ...]]
     n_args: int
     n_outputs: int
+
+
+def _unit(length: int, index: int) -> tuple[float, ...]:
+    """
+    Build the one-hot seed selecting a single Jacobian row or column.
+
+    Parameters
+    ----------
+    length : int
+        Number of components in the seed.
+    index : int
+        Zero-based position of the single non-zero component.
+
+    Returns
+    -------
+    tuple of float
+        `length` values, all zero but the one at `index`.
+
+    See Also
+    --------
+    load : Seeds the derivative callables it builds with this.
+
+    Examples
+    --------
+    >>> from numba_enzyme.runtime import _unit
+    >>> _unit(3, 1)
+    (0.0, 1.0, 0.0)
+    """
+    return tuple(1.0 if position == index else 0.0 for position in range(length))
+
+
+def _split_index(args, n_args: int, limit: int, kind: str, noun: str):
+    """
+    Split primal values from a trailing row or column index.
+
+    Parameters
+    ----------
+    args : tuple
+        The primal values followed by exactly one index.
+    n_args : int
+        Number of primal values expected.
+    limit : int
+        Exclusive upper bound on the index.
+    kind : str
+        What the index selects, ``"row"`` or ``"column"``, for error messages.
+    noun : str
+        What `limit` counts, for error messages.
+
+    Returns
+    -------
+    xs : tuple of float
+        The primal values.
+    index : int
+        The validated index.
+
+    Raises
+    ------
+    TypeError
+        If the argument count is wrong or the index is not integral.
+    IndexError
+        If the index is out of range.
+
+    See Also
+    --------
+    _unit : Turns the returned index into a seed.
+
+    Examples
+    --------
+    >>> from numba_enzyme.runtime import _split_index
+    >>> _split_index((2.0, 3.0, 1), 2, 2, "column", "arguments")
+    ((2.0, 3.0), 1)
+    """
+    if len(args) != n_args + 1:
+        raise TypeError(
+            f"expected {n_args} primal arguments and one {kind} index, got {len(args)}"
+        )
+    *xs, index = args
+    try:
+        index = operator.index(index)
+    except TypeError:
+        raise TypeError(f"{kind} index must be an integer") from None
+    if not 0 <= index < limit:
+        raise IndexError(f"{kind} index {index} is out of range for {limit} {noun}")
+    return tuple(xs), index
 
 
 def load(built: BuiltKernel) -> Differentiable:
@@ -167,7 +341,7 @@ def load(built: BuiltKernel) -> Differentiable:
     Returns
     -------
     Differentiable
-        Plain Python callables wrapping `built`'s grad/JVP symbols.
+        Plain Python callables exposing every supported derivative mode.
 
     See Also
     --------
@@ -189,134 +363,76 @@ def load(built: BuiltKernel) -> Differentiable:
     n = built.n_args
     m = built.n_outputs
     arg_specs = built.arg_specs
-    n_scalar = sum(1 for spec in arg_specs if spec.kind == "scalar")
+    scalar_ctypes = [
+        _CTYPES_SCALAR_TYPE[spec.llvm_type]
+        for spec in arg_specs
+        if spec.kind == "scalar"
+    ]
+    return_ctype = _CTYPES_SCALAR_TYPE[built.return_type]
+    has_array = any(spec.kind == "array" for spec in arg_specs)
 
-    grad_argtypes = [ctypes.POINTER(ctypes.c_double)] if n_scalar else []
-    jvp_argtypes = []
-    for spec in arg_specs:
-        if spec.kind == "scalar":
-            grad_argtypes.append(ctypes.c_double)
-            jvp_argtypes += [ctypes.c_double, ctypes.c_double]
-        else:
-            grad_argtypes += _array_ctypes_argtypes(spec)
-            jvp_argtypes += _array_ctypes_argtypes(spec)
-
-    grad_fn = getattr(lib, built.grad_symbol)
-    grad_fn.restype = None
-    grad_fn.argtypes = grad_argtypes
+    vjp_fn = getattr(lib, built.vjp_symbol)
+    vjp_fn.restype = None
+    vjp_fn.argtypes = [
+        *[ctypes.POINTER(ctype) for ctype in scalar_ctypes],
+        ctypes.POINTER(return_ctype),
+        *_argument_ctypes(arg_specs, forward=False),
+    ]
 
     jvp_fn = getattr(lib, built.jvp_symbol)
-    jvp_fn.restype = ctypes.c_double
-    jvp_fn.argtypes = jvp_argtypes
-    if m != 1:
+    jvp_fn.argtypes = _argument_ctypes(arg_specs, forward=True)
+    if m == 1:
+        jvp_fn.restype = return_ctype
+    else:
         # A tuple result's tangent is written through a trailing out pointer.
         jvp_fn.restype = None
-        jvp_fn.argtypes += (ctypes.POINTER(ctypes.c_double),)
+        jvp_fn.argtypes += (ctypes.POINTER(return_ctype),)
 
-    def grad(*xs) -> tuple:
+    def scalar_arguments_only(mode: str) -> None:
         """
-        Compute the reverse-mode gradient.
+        Reject a mode that does not support array arguments yet.
 
         Parameters
         ----------
-        *xs : float or numpy.ndarray
-            The point(s) to differentiate at, one per argument,
-            matching each argument's declared scalar/array type.
-
-        Returns
-        -------
-        tuple
-            The gradient with respect to each argument: a `float` for
-            a scalar argument, a `numpy.ndarray` of the same shape for
-            an array argument.
+        mode : str
+            Name of the derivative mode, for the error message.
 
         Raises
         ------
         TypeError
-            If the underlying function has a tuple result, the number of
-            arguments given doesn't match `n_args`, or an argument's Python
-            type doesn't match its declared scalar/array kind.
-
-        Examples
-        --------
-        >>> from numba_enzyme.build import build
-        >>> from numba_enzyme.runtime import load
-        >>> from numba_enzyme.types import Float64
-        >>> def f(x: Float64) -> Float64:
-        ...     return x * x
-        >>> load(build(f)).grad(2.0)  # doctest: +SKIP
-        (4.0,)
+            If the underlying function takes an array argument.
         """
-        if m != 1:
+        if has_array:
             raise TypeError(
-                "grad requires a scalar-output function; use jvp for tuple outputs"
+                f"{mode} does not support array arguments yet; use grad or jvp"
             )
-        if len(xs) != n:
-            raise TypeError(f"expected {n} arguments, got {len(xs)}")
 
-        call_args = []
-        out = (ctypes.c_double * n_scalar)() if n_scalar else None
-        if out is not None:
-            call_args.append(out)
-        results = [None] * n
-        for i, (spec, x) in enumerate(zip(arg_specs, xs)):
-            if spec.kind == "scalar":
-                if isinstance(x, np.ndarray):
-                    raise TypeError(f"argument {i} expected a scalar, got an ndarray")
-                call_args.append(float(x))
-            else:
-                if not isinstance(x, np.ndarray):
-                    raise TypeError(
-                        f"argument {i} expected a numpy.ndarray, got {type(x)!r}"
-                    )
-                data_ptr, nitems, itemsize, shape, strides = _as_array_args(x, spec)
-                d_arr = np.zeros_like(x)
-                elem_ctype = _ELEM_CTYPE[spec.elem_llvm_type]
-                d_data_ptr = d_arr.ctypes.data_as(ctypes.POINTER(elem_ctype))
-                call_args += [
-                    data_ptr,
-                    d_data_ptr,
-                    nitems,
-                    itemsize,
-                    *shape,
-                    *strides,
-                ]
-                results[i] = d_arr
-
-        grad_fn(*call_args)
-
-        scalar_i = 0
-        for i, spec in enumerate(arg_specs):
-            if spec.kind == "scalar":
-                results[i] = out[scalar_i]
-                scalar_i += 1
-        return tuple(results)
-
-    def jvp(xs: tuple, seed: tuple) -> float | tuple[float, ...]:
+    def jvp(
+        xs: tuple[float, ...], seed: tuple[float, ...]
+    ) -> float | tuple[float, ...]:
         """
         Compute the forward-mode Jacobian-vector product.
 
         Parameters
         ----------
         xs : tuple
-            The point to differentiate at, one value per argument
-            (`float` or `numpy.ndarray`, matching each argument's
-            declared kind).
+            The point to differentiate at, one value per argument (`float` or
+            `numpy.ndarray`, matching each argument's declared kind).
         seed : tuple
-            The tangent direction, one value per argument, matching
-            `xs`'s shapes.
+            The tangent direction, one value per argument, matching `xs`'s
+            shapes.
 
         Returns
         -------
         float or tuple of float
-            The directional derivative of the underlying function at
-            `xs` in direction `seed`, one value per output component for
-            a tuple result.
+            The directional derivative of the underlying function at `xs` in
+            direction `seed`. A vector-output function returns one tangent per
+            output component.
 
         Raises
         ------
         TypeError
-            If `xs` or `seed` doesn't have exactly `n_args` values.
+            If `xs` or `seed` doesn't have exactly `n` values.
 
         Examples
         --------
@@ -330,36 +446,205 @@ def load(built: BuiltKernel) -> Differentiable:
         """
         if len(xs) != n or len(seed) != n:
             raise TypeError(f"expected {n} values for both xs and seed")
-
-        call_args = []
-        for i, (spec, x, dx) in enumerate(zip(arg_specs, xs, seed)):
-            if spec.kind == "scalar":
-                call_args += [float(x), float(dx)]
-            else:
-                if not isinstance(x, np.ndarray) or not isinstance(dx, np.ndarray):
-                    raise TypeError(
-                        f"argument {i} expected numpy.ndarray primal and tangent"
-                    )
-                if dx.shape != x.shape:
-                    raise ValueError(
-                        f"argument {i}'s tangent shape {dx.shape} doesn't match "
-                        f"its primal shape {x.shape}"
-                    )
-                data_ptr, nitems, itemsize, shape, strides = _as_array_args(x, spec)
-                elem_ctype = _ELEM_CTYPE[spec.elem_llvm_type]
-                d_data_ptr = dx.ctypes.data_as(ctypes.POINTER(elem_ctype))
-                call_args += [
-                    data_ptr,
-                    d_data_ptr,
-                    nitems,
-                    itemsize,
-                    *shape,
-                    *strides,
-                ]
+        call_args = _primal_args(arg_specs, xs, seed)
         if m == 1:
             return jvp_fn(*call_args)
-        out = (ctypes.c_double * m)()
+        out = (return_ctype * m)()
         jvp_fn(*call_args, out)
         return tuple(out)
 
-    return Differentiable(grad=grad, jvp=jvp, n_args=n, n_outputs=m)
+    def vjp(
+        xs: tuple[float, ...], cotangent: float | tuple[float, ...]
+    ) -> tuple[float, ...]:
+        """
+        Compute a reverse-mode vector-Jacobian product.
+
+        Parameters
+        ----------
+        xs : tuple
+            The point to differentiate at, one value per input argument
+            (`float` or `numpy.ndarray`, matching each argument's declared
+            kind).
+        cotangent : float or tuple of float
+            Scalar seed for a scalar result or one seed per vector component.
+
+        Returns
+        -------
+        tuple
+            Input cotangent, one value per primal argument: a `float` for a
+            scalar argument, a `numpy.ndarray` of the same shape for an array
+            argument.
+
+        Raises
+        ------
+        TypeError
+            If the primal or cotangent shape does not match the function.
+
+        Examples
+        --------
+        >>> from numba_enzyme.build import build
+        >>> from numba_enzyme.runtime import load
+        >>> from numba_enzyme.types import Float64
+        >>> def f(x: Float64) -> Float64:
+        ...     return x * x
+        >>> load(build(f)).vjp((2.0,), 1.0)  # doctest: +SKIP
+        (4.0,)
+        """
+        if len(xs) != n:
+            raise TypeError(f"expected {n} primal values, got {len(xs)}")
+        if m == 1:
+            if isinstance(cotangent, (tuple, list)):
+                raise TypeError("expected a scalar cotangent for a scalar output")
+            cotangents = (cotangent,)
+        else:
+            try:
+                cotangents = tuple(cotangent)
+            except TypeError:
+                raise TypeError(f"expected {m} cotangent values") from None
+            if len(cotangents) != m:
+                raise TypeError(f"expected {m} cotangent values, got {len(cotangents)}")
+
+        outputs = [ctype() for ctype in scalar_ctypes]
+        gradients = [
+            np.zeros_like(x)
+            if spec.kind == "array" and isinstance(x, np.ndarray)
+            else None
+            for spec, x in zip(arg_specs, xs)
+        ]
+        vjp_fn(
+            *[ctypes.byref(output) for output in outputs],
+            (return_ctype * m)(*cotangents),
+            *_primal_args(arg_specs, xs, gradients),
+        )
+        scalars = iter(output.value for output in outputs)
+        return tuple(
+            next(scalars) if spec.kind == "scalar" else gradient
+            for spec, gradient in zip(arg_specs, gradients)
+        )
+
+    def grad(*xs: float) -> tuple[float, ...]:
+        """
+        Compute the reverse-mode gradient.
+
+        Parameters
+        ----------
+        *xs : float or numpy.ndarray
+            The point(s) to differentiate at, one per argument, matching each
+            argument's declared scalar/array type.
+
+        Returns
+        -------
+        tuple
+            The gradient with respect to each argument: a `float` for a scalar
+            argument, a `numpy.ndarray` of the same shape for an array
+            argument.
+
+        Raises
+        ------
+        TypeError
+            If the underlying function has a vector result, or the number of
+            arguments given doesn't match `n`.
+
+        Examples
+        --------
+        >>> from numba_enzyme.build import build
+        >>> from numba_enzyme.runtime import load
+        >>> from numba_enzyme.types import Float64
+        >>> def f(x: Float64) -> Float64:
+        ...     return x * x
+        >>> load(build(f)).grad(2.0)  # doctest: +SKIP
+        (4.0,)
+        """
+        if m != 1:
+            raise TypeError(
+                "grad requires a scalar-output function; use jacfwd or jvp "
+                "for tuple outputs"
+            )
+        if len(xs) != n:
+            raise TypeError(f"expected {n} arguments, got {len(xs)}")
+        return vjp(xs, 1.0)
+
+    def jacfwd(*xs: float) -> tuple:
+        """
+        Compute the full forward-mode Jacobian.
+
+        Parameters
+        ----------
+        *xs : float
+            The point to differentiate at, one value per primal argument.
+
+        Returns
+        -------
+        tuple
+            For a scalar output, one partial derivative per primal argument.
+            For a tuple output, an output-by-input tuple matrix.
+
+        Raises
+        ------
+        TypeError
+            If the number of arguments given doesn't match `n`.
+
+        Examples
+        --------
+        >>> from numba_enzyme.build import build
+        >>> from numba_enzyme.runtime import load
+        >>> from numba_enzyme.types import Float64
+        >>> def f(x: Float64) -> Float64:
+        ...     return x * x
+        >>> load(build(f)).jacfwd(2.0)  # doctest: +SKIP
+        (4.0,)
+        """
+        scalar_arguments_only("jacfwd")
+        if len(xs) != n:
+            raise TypeError(f"expected {n} arguments, got {len(xs)}")
+        columns = tuple(jvp(xs, _unit(n, column)) for column in range(n))
+        if m == 1:
+            return columns
+        return tuple(
+            tuple(columns[column][row] for column in range(n)) for row in range(m)
+        )
+
+    def jacfwd_column(*args: float) -> float | tuple[float, ...]:
+        """
+        Compute one column of the forward-mode Jacobian.
+
+        Parameters
+        ----------
+        *args : float
+            The primal values followed by a zero-based integer column index.
+
+        Returns
+        -------
+        float or tuple of float
+            The partial derivative for the selected input column. A
+            vector-output function returns one value per output component.
+
+        Raises
+        ------
+        TypeError
+            If the number of arguments is wrong or the index is not integral.
+        IndexError
+            If the column index is out of range.
+
+        Examples
+        --------
+        >>> from numba_enzyme.build import build
+        >>> from numba_enzyme.runtime import load
+        >>> from numba_enzyme.types import Float64
+        >>> def f(x: Float64) -> Float64:
+        ...     return x * x
+        >>> load(build(f)).jacfwd_column(2.0, 0)  # doctest: +SKIP
+        4.0
+        """
+        scalar_arguments_only("jacfwd_column")
+        xs, column = _split_index(args, n, n, "column", "arguments")
+        return jvp(xs, _unit(n, column))
+
+    return Differentiable(
+        grad=grad,
+        jvp=jvp,
+        jacfwd=jacfwd,
+        jacfwd_column=jacfwd_column,
+        n_args=n,
+        n_outputs=m,
+    )

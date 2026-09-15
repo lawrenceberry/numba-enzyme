@@ -29,8 +29,22 @@ Examples
 
 from importlib.metadata import version
 
-from numba_enzyme.core import Differentiable, differentiable, grad, jvp
+from numba_enzyme.core import (
+    Differentiable,
+    differentiable,
+    grad,
+    jacfwd,
+    jacfwd_column,
+    jvp,
+)
 
 __version__ = version("numba-enzyme")
 
-__all__ = ["Differentiable", "differentiable", "grad", "jvp"]
+__all__ = [
+    "Differentiable",
+    "differentiable",
+    "grad",
+    "jacfwd",
+    "jacfwd_column",
+    "jvp",
+]

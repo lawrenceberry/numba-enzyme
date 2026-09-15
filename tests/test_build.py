@@ -85,6 +85,8 @@ def test_tuple_output_metadata_survives_a_cache_hit():
     second = build(tuple_valued)
 
     assert first.n_outputs == second.n_outputs == 2
+    assert first.return_type == second.return_type == "double"
+    assert second.vjp_symbol == first.vjp_symbol
     assert second.jvp_symbol == first.jvp_symbol
     assert second.from_cache is True
-    assert load(second).jvp((2.0, 3.0), (0.0, 1.0)) == pytest.approx((2.0, 1.0))
+    assert load(second).jacfwd_column(2.0, 3.0, 1) == pytest.approx((2.0, 1.0))

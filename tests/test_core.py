@@ -7,7 +7,13 @@ import math
 
 import pytest
 
-from numba_enzyme.core import differentiable, grad, jvp
+from numba_enzyme.core import (
+    differentiable,
+    grad,
+    jacfwd,
+    jacfwd_column,
+    jvp,
+)
 from numba_enzyme.types import Float64
 
 
@@ -19,7 +25,7 @@ def f_grad(x, y):
     return (math.cos(x) * y + y * y, math.sin(x) + 2 * x * y)
 
 
-def f_tuple(x: Float64, y: Float64) -> tuple[Float64, Float64]:
+def f_vector(x: Float64, y: Float64) -> tuple[Float64, Float64]:
     return x * y, x * x + y
 
 
@@ -50,9 +56,31 @@ def test_jvp_matches_analytic():
     assert j((x, y), (0.0, 1.0)) == pytest.approx(expected[1], abs=1e-9)
 
 
-def test_grad_rejects_tuple_output():
+def test_jacfwd_matches_analytic():
+    x, y = 1.3, 0.7
+    assert jacfwd(f)(x, y) == pytest.approx(f_grad(x, y), abs=1e-9)
+
+
+def test_jacfwd_column_matches_analytic():
+    x, y = 1.3, 0.7
+    expected = f_grad(x, y)
+    column = jacfwd_column(f)
+    assert column(x, y, 0) == pytest.approx(expected[0], abs=1e-9)
+    assert column(x, y, 1) == pytest.approx(expected[1], abs=1e-9)
+
+
+def test_vector_output_public_forward_apis():
+    x, y = 1.3, 0.7
+    assert jvp(f_vector)((x, y), (1.0, 0.0)) == pytest.approx((y, 2 * x))
+    jacobian = jacfwd(f_vector)(x, y)
+    assert jacobian[0] == pytest.approx((y, x))
+    assert jacobian[1] == pytest.approx((2 * x, 1.0))
+    assert jacfwd_column(f_vector)(x, y, 1) == pytest.approx((x, 1.0))
+
+
+def test_grad_rejects_vector_output():
     with pytest.raises(TypeError, match="grad requires a scalar-output function"):
-        grad(f_tuple)(1.0, 2.0)
+        grad(f_vector)
 
 
 def test_differentiable_wrapper_calls_original_function():
@@ -60,13 +88,22 @@ def test_differentiable_wrapper_calls_original_function():
     assert f_decorated(x, y) == f(x, y)
 
 
-def test_differentiable_wrapper_exposes_grad_and_jvp():
+def test_differentiable_wrapper_exposes_all_derivative_modes():
     x, y = 1.3, 0.7
     expected = f_grad(x, y)
     assert f_decorated.grad(x, y) == pytest.approx(expected, abs=1e-9)
     assert f_decorated.jvp((x, y), (1.0, 0.0)) == pytest.approx(expected[0], abs=1e-9)
+    assert f_decorated.jacfwd(x, y) == pytest.approx(expected, abs=1e-9)
+    assert f_decorated.jacfwd_column(x, y, 1) == pytest.approx(expected[1], abs=1e-9)
 
 
 def test_differentiable_grad_is_cached():
     grad_callable = f_decorated.grad
     assert f_decorated.grad is grad_callable
+
+
+def test_differentiable_forward_jacobian_callables_are_cached():
+    whole = f_decorated.jacfwd
+    column = f_decorated.jacfwd_column
+    assert f_decorated.jacfwd is whole
+    assert f_decorated.jacfwd_column is column
