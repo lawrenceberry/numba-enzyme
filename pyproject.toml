@@ -15,11 +15,12 @@ authors = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-    # The CPU driver is written against these; the CUDA backend only touches
-    # llvmlite.ir and numba's version string, so newer releases work there and
-    # the exact pins would otherwise force a downgrade on any CUDA consumer.
-    "llvmlite>=0.44",
-    "numba>=0.61",
+    # The CPU pipeline feeds Numba's IR to the vendored LLVM 15 tools, which
+    # can only parse what llvmlite 0.44 (LLVM 15) emits: numba 0.62+ moved to
+    # a newer LLVM whose IR attributes llvm-link-15 rejects. The CUDA backend
+    # works with these too, since numba-cuda-mlir does not depend on numba.
+    "llvmlite>=0.44,<0.45",
+    "numba>=0.61,<0.62",
 ]
 
 classifiers = [
