@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import platform
@@ -20,7 +21,7 @@ _DEFAULT_WHEEL_VERSION = "0.1.3"
 # come from, and this fork (published as numba-enzyme-cuda) has none of
 # its own to download. Same reasoning as hatch_build.py.
 _DISTRIBUTION = "numba-enzyme"
-_TOOLS = ("clang", "llvm-link", "opt", "ld.lld")
+_TOOLS = ("clang", "llvm-link", "opt", "llvm-extract", "ld.lld")
 
 
 def _vendor_dir(destination: Path) -> Path:
@@ -71,6 +72,15 @@ def _install_with_uv(destination: Path, wheel_version: str) -> None:
     )
 
 
+def _fetch_llvm_extract(destination: Path) -> None:
+    # The released wheel predates llvm-extract; take it from LLVM instead.
+    helper = Path(__file__).resolve().parent / "llvm_extract.py"
+    spec = importlib.util.spec_from_file_location("llvm_extract", helper)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.fetch_llvm_extract(destination)
+
+
 def _installed_version(destination: Path) -> str | None:
     try:
         metadata = json.loads((destination / "bootstrap.json").read_text())
@@ -110,6 +120,9 @@ def bootstrap(destination: Path, wheel_version: str, force: bool = False) -> boo
         staged = Path(temporary) / destination.name
         staged.mkdir()
         _install_with_uv(staged, wheel_version)
+        llvm_extract = _vendor_dir(staged) / "bin" / "llvm-extract"
+        if not llvm_extract.is_file():
+            _fetch_llvm_extract(llvm_extract)
         missing = _validate(staged)
         if missing:
             raise RuntimeError(

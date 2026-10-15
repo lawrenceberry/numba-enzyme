@@ -274,7 +274,9 @@ uv run python packaging/bootstrap_dev_toolchain.py
 ```
 
 The toolchain is extracted into the ignored `.dev-toolchain/` directory and is
-discovered automatically; no `PATH` or `NUMBA_ENZYME_PLUGIN_PATH` changes are
+discovered automatically. Most of it comes from upstream's released
+numba-enzyme wheel; `llvm-extract`, which that wheel predates, is fetched from
+LLVM's 15.0.6 release and checked against a pinned SHA-256. No no `PATH` or `NUMBA_ENZYME_PLUGIN_PATH` changes are
 needed. The bootstrap is idempotent and accepts `--force` to refresh the
 toolchain. The development dependency set includes Numba-CUDA-MLIR's CUDA 12
 compiler/runtime components, so a host with a compatible NVIDIA driver can run

@@ -50,6 +50,7 @@ jobs:
           chmod +x unpacked/numba_enzyme/_vendor/bin/*
           unpacked/numba_enzyme/_vendor/bin/clang --version
           unpacked/numba_enzyme/_vendor/bin/opt --version
+          unpacked/numba_enzyme/_vendor/bin/llvm-extract --version
 
       - uses: actions/upload-artifact@v4
         with:

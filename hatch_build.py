@@ -1,8 +1,8 @@
 """
 Vendor the pre-built LLVM/Enzyme binaries into the wheel.
 
-The derivative pipeline shells out to `clang`/`llvm-link`/`opt` from
-LLVM 15 and loads the standalone Enzyme plugin, none of which are in
+The derivative pipeline shells out to `clang`/`llvm-link`/`opt`/
+`llvm-extract` from LLVM 15 and loads the standalone Enzyme plugin, none of which are in
 the source tree. `toolchain.py` looks for them under
 `src/numba_enzyme/_vendor/` first, so a wheel built without that
 directory installs cleanly and then fails at the first differentiation
@@ -18,8 +18,10 @@ Two things populate `_vendor/`:
   manylinux wheel from PyPI and reuses the binaries it already carries.
   That is the same trick `packaging/bootstrap_dev_toolchain.py` uses for
   editable checkouts, and it is what makes the git URL installable on
-  its own. Set `NUMBA_ENZYME_VENDOR_FROM_PYPI=0` to suppress it and
-  build a toolchain-less wheel deliberately.
+  its own. That wheel predates `llvm-extract`, so the hook also fetches
+  it from LLVM's own release (see `packaging/llvm_extract.py`). Set
+  `NUMBA_ENZYME_VENDOR_FROM_PYPI=0` to suppress both downloads and build
+  a toolchain-less wheel deliberately.
 
 A static `force-include` in pyproject.toml can't express any of this --
 hatchling requires force-included files to exist unconditionally -- so
@@ -48,6 +50,7 @@ contents.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import shutil
@@ -73,8 +76,18 @@ _WHEEL_TAG = "py3-none-manylinux_2_38_x86_64"
 
 # Everything toolchain.py resolves, and so everything the staged tree
 # has to hold for the wheel to be worth shipping.
-_TOOLS = ("clang", "llvm-link", "opt", "ld.lld")
+_TOOLS = ("clang", "llvm-link", "opt", "llvm-extract", "ld.lld")
 _PLUGIN = "enzyme/LLVMEnzyme-15.so"
+
+
+def _fetch_llvm_extract(destination: Path) -> None:
+    # Loaded by path: the build hook runs with the project root, not
+    # packaging/, on sys.path.
+    helper = Path(__file__).resolve().parent / "packaging" / "llvm_extract.py"
+    spec = importlib.util.spec_from_file_location("llvm_extract", helper)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.fetch_llvm_extract(destination)
 
 
 def _released_wheel_url(version: str) -> str:
@@ -173,6 +186,14 @@ class VendorBuildHook(BuildHookInterface):
                 f"{wheel_version} on PyPI"
             )
             _stage_from_pypi(vendor_dir, wheel_version)
+
+        llvm_extract = vendor_dir / "bin" / "llvm-extract"
+        if (
+            not llvm_extract.is_file()
+            and os.environ.get("NUMBA_ENZYME_VENDOR_FROM_PYPI", "1") != "0"
+        ):
+            self.app.display_info("fetching llvm-extract from the LLVM 15.0.6 release")
+            _fetch_llvm_extract(llvm_extract)
 
         missing = _missing(vendor_dir)
         if missing:
